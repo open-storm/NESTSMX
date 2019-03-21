@@ -1,43 +1,49 @@
-// This #include statement was automatically added by the Particle IDE.
+// This #include adds PhoBot header
 #include "PhoBot.h"
-//current version is trying to have data sent to ARB in influx (commented out at end) and readings are frequent 
-//Took out fcl read function since don't need it for Mexico
-//The code to run the sensor off the PhoBot and solenoid valve
-//for sensors and pressure together
 
-// don't actually know what the 9.0 are forPhoBot p = PhoBot(9.0, 9.0); some examples have it as that, others with ()
+//I2C EZO ID numbers
+#define pH_address 99
+#define ORP_address 98
+#define EC_address 100
+#define RTD_address 102
+#define NUM_SENSORS 4
 
-PhoBot p = PhoBot();
-
-//#include <Wire.h>                 //enable I2C.
-#define pH_address 99               //default I2C ID number for EZO pH Circuit.
-#define ORP_address 98              //default I2C ID number for EZO ORP Circuit
-#define EC_address 100              //default I2C ID number for EZO EC Circuit
-#define RTD_address 102             //default I2C ID number for EZO Temp Circuit
 #define pres_pin A0                //sets analog pin number for pressure sensor 
 
-// Client to communicate to influx
-TCPClient client;
+#define PRES_READ_PERIOD 5  //defined in minutes. Take a pressure reading every 5 minutes
+#define SENS_READ_PERIOD 60 //defined in minutes. Take a sensor reading every 60 minutes
+#define AWAKE_TIME 30 //defined in seconds. How long to stay awake after taking reading
+#define FLUSH_TIME 5  //defined in seconds. How long to turn valve on
+
+#define NUM_READINGS 3
+#define PRESSURE_THRESHOLD 20
+#define NODE_ID "MEX007"
 
 #define POSTNAME ""
 #define HOSTNAME ""
 #define HOSTNUM 0
 
+// Client to communicate to influx
+TCPClient client;
+
+//Phobot to control peripherals
+PhoBot p = PhoBot();
+
 //creates a vector of the sensor address numbers
 const int address[]={RTD_address,ORP_address,EC_address,pH_address};
-// creates a string of the sensor names that will be how it's reported to grafana for FROM
+// array of sensor names that will be how it's reported to grafana for FROM
 String sensors[4] = {"Temp", "ORP", "EC", "pH"};
 // creats a string for the different measurements the EC sensor takes and how it's reported to grafana for FROM
 String econd[4] = {"EC", "TDS", "SAL", "SG"};
 
+String measurements[4] = {"", "", "", ""};
 
-//This part came with the sample code
-char computerdata[40];              //we make a 20 byte character array to hold incoming data from a pc/mac/other.
-byte received_from_computer = 0;    //we need to know how many characters have been received.
+
+char computerdata[40];              //we make an 40 byte character array to hold incoming data from a pc/mac/other.
 byte code = 0;                      //used to hold the I2C response code.
 
 
-char _data[200];                    //we make a 40-byte character array to hold incoming data from any circuit.
+char _data[200];                    //we make a 200-byte character array to hold incoming data from any circuit.
 byte in_char = 0;                   //used as a 1 byte buffer to store inbound bytes from the pH Circuit.
 
 
@@ -48,33 +54,9 @@ char *sg;                       //char pointer used in string parsing.
 
 double adc = 0;                 //variable used for analog to digital conversion
 float mv=0;                     //millivolts measured from the ADC
-
-//double volts = 0.0;             //For Phobot usage
-
-
-//parameters to change as pleased for timing
-/* easy change parameters
-.
-..
-...
-....
-.....
-......
-.......
-........
-.......
-......
-.....
-....
-...
-..
-.
-*/
-int zzz = (5) * 60 - 5 - 2;        //sleep time for (n) MINUTE sleep (multiples by 60 to change it into minutes actually and takes into acount ~5 seconds to power on and connect with -5 and 2 seconds for pressure delay)
-double flush = 5;               //initializes number of SECONDS to have valve on
 int awake = (30);               //how many SECONDS the photon will remain awake to recieve updates or whatever
-int p_thresh = 20;              //pressure (psi) threshold for valve to open 
-String node_id = "MEX005";
+
+int presCounter = 0;
 /*
 .
 ..
@@ -94,9 +76,11 @@ String node_id = "MEX005";
 */
 
 
+
 void setup()                    
 //hardware initialization.
 {
+    
     pinMode(pres_pin, INPUT);         //set pin as an input for the pressure transducer
     //pinMode(D7, OUTPUT);  //commented out because not using beef cake    //Sets digital pin 4 as output for the relay switch to motor
     Serial.begin(9600);           //enable serial port.
@@ -112,121 +96,75 @@ void setup()
     
 }
 
-
-
-
-void loop() {   
-//the main loop basically just sets up to take readings and exchange water once an hour and to wake up every 15 minutes for updates
-//tips: System.sleep takes in and argument of time in SECONDS so you don't have to *1000 but delay takes in argument of time in MILISECONDS, hence (time in seconds desired)*1000 to convert  
+void loop(){
+    unsigned long startTime = millis();
+    //bootLegWake(); //wake up
+    p.setMotors("M3-B-100");
+    delay(1000);
+    p.setMotors("M3-S");
     
-    for(int t = 0; t < 12; t++){         // sets hourly cycle (5 minute sleeps if t < 12, 15 minute sleeps if t < 4)
-        //loop for 20 minutes (because 3 readings per minute * 20 minutes = 60), taking readings every 20 seconds
-        p.setMotors("M3-B-100");    //send pulse to turn off valve
-        delay(1000);
-        p.setMotors("M3-S");
+    //start of hour cycle
+    if (presCounter == 0){
+        p.setMotors("M1-F-100");
+        float press = take_pressure();
+        p.setMotors("M1-S");
         
-        if (t == 0) {
-        //start of hour cycle
-            p.setMotors("M1-F-100");            //Turns on pressure
-            float press = take_pressure();                    //Takes pressure reading on the water pipes. Eventually if pressure is available it will trigger the valve and then take WQ readings.
-            p.setMotors("M1-S");                //shutoff pressure supply
-            
-            if (press > p_thresh) {                   //pres > n where n is the threshold pressure in psi for the valve to open
-                water_exchange(flush);              //cycles solution for n SECONDS at begining of hour cycle (where n is the number in the '()')
-                delay(2*60*1000);                   //stay on for 2 minutes to adjust to new water solution then take readings
-                take_reading();                     //takes reading, about 9 second time usage
-                System.sleep(D3,RISING,(zzz - flush - 9 - 2*60));            //takes into account time used for each function the D3, RISING is arbritrary
-                //deep sleep is not used because then it would forget what iteration out of 12 it is in
-            }
-            
-            else {
-                delay((awake)*1000);        //stays on for remainder of awake seconds
-                System.sleep(D3,RISING,(zzz - awake));            //takes into account time used for each function the D3, RISING is arbritrary
-                //deep sleep is not used because then it would forget what iteration out of 12 it is in
-            }
-            
-        }   
-        
-        else if (t == 11) {
-            p.setMotors("M1-F-100");            //Turns on pressure
-            take_pressure();                    //Takes pressure reading on the water pipes. Eventually if pressure is available it will trigger the valve and then take WQ readings.
-            p.setMotors("M1-S");                //shutoff pressure supply
-            
-            delay(awake*1000);        //stays on for remainder of awake seconds
-            
-            System.sleep(SLEEP_MODE_DEEP, zzz - awake);   //deep sleep for zzz minutes, will do complete reset after time -- saves energy
-            //deep sleep mode just saves on power, every little bit counts!
+        if (press > PRESSURE_THRESHOLD){
+            water_exchange(FLUSH_TIME);
+            delay(2*60*1000); //delay 2 minutes
+            take_reading();
+        }
+        else {
+            delay(awake*1000); //stay on for awake seconds
         }
         
-        else{
-            p.setMotors("M1-F-100");            //Turns on pressure
-            take_pressure();                    //Takes pressure reading on the water pipes. Eventually if pressure is available it will trigger the valve and then take WQ readings.
-            p.setMotors("M1-S");                //shutoff pressure supply
-            
-            delay(awake*1000);                      //Just have one for awake seconds
-            System.sleep(D3,RISING,(zzz - awake));      //takes into account time used for each function 
-        }
-        //volts = p.batteryVolts();             //publishes battery level --- for Phobot
-        //Particle.publish("battery voltage is: " + String(volts)); //publishes onto cloud
     }
-            
-   /*for(int del = 0; del < 11; del++) { //60  minutes loop --- CHECK THE MATH SINCE THIS IS OUTDATED - maybe one day I'll make algorithms to make it easier ¯\_(ツ)_/¯
-        
-        Particle.publish("Ready for commands");         //can see on particle console that the photon is infact on -- BUT MAYBE SHUT THIS OFF TO SAVE ON DATA
-        delay(5000);
-        
-        //delay(10 *1000);              //awake for 10 seconds to take in new updates
-        
-        if(del == 0){                   //if at start of cycle
-        //exchanges water and takes pH, ORP, EC, Temp   
-            
-            water_exchange(flush);           //exchanges old water out for new water for flush seconds at begining of hour cycle
-            take_reading();                 //takes readings of pH, orp, ec, temp
-            delay(20*1000); 
-            System.sleep(D3,RISING,zzz);     //takes into account time used for each function 
-            
-        }
-        
-        
-        else if( del != 10 && del != 1){ //as del = 10 is the last loop
-            
-            //take_pressure();
-            take_reading();                 //takes readings of pH, orp, ec, temp
-            System.sleep(D3,RISING,zzz); 
-            //pins picked arbritarily, will put the whole system into sleep until time has elapsed
-        }
-        
-        else{ 
-        //meaning end of loop - it will go into deep sleep mode for however long is specified in zzz
-                    take_reading();             //takes readings of pH, orp, ec, temp
-            System.sleep(SLEEP_MODE_DEEP, zzz); // will sleep for zzz minutes
-        }
-    } 
-    */
+    else{
+        p.setMotors("M1-F-100");            //Turns on pressure
+        take_pressure();                    //Takes pressure reading on the water pipes. Eventually if pressure is available it will trigger the valve and then take WQ readings.
+        p.setMotors("M1-S");                //shutoff pressure supply
+        delay(awake*1000);                      //Just have one for awake seconds
+    }
+    
+    presCounter = (presCounter + 1) % (SENS_READ_PERIOD / PRES_READ_PERIOD);
+    
+    //TODO
+    /* do full reset once our pressure counter hits 0 again to save more power
+    //To do even past that, see if we can have presCounter saved somewhere to always deep sleep...it's 4 bytes of information -_-
+    if (presCounter == 0){
+        //deep sleep
+    }
+    else{
+        //normal sleep
+    }
+    */ 
+    //while boron sleep is unestablished, simply delay
+    unsigned long timeElapsed= millis() - startTime; //gets time elapsed in milliseconds
+    delay(PRES_READ_PERIOD*60*1000 - timeElapsed);
     
 }
-
-
 
 
 void take_reading() {
 //takes readings of all the parameters (-pressure) of the continuously flowing system
 
-    for(int read = 0; read < 3; read++){
+    for(int read = 0; read < NUM_READINGS; read++){
     //takes 3 readings of each parameter ~ 9 seconds run time
-        
         computerdata[0] = 'r';              //sends the command to read
         
-        // TOOK OUT = in <= to make just < -- could be source of error if any arises but should still work the same
-        for (int i=0; i < 4; i++){    //Initialize for-loop to address all 4 (0,1,2,3) positions of the circuits address[] array (goes through all the sensor ID's)
+        for (int i=0; i < NUM_SENSORS; i++){    //Initialize for-loop to address all 4 (0,1,2,3) positions of the circuits address[] array (goes through all the sensor ID's)
             
-            
+            if (i == 3){
+                computerdata[1] = 't';
+                strcpy(computerdata+2, measurements[0].c_str());
+            }   
+
             Wire.beginTransmission(address[i]);     //call the circuit by its ID number.
             Wire.write(computerdata);               //transmit the read command.
             Wire.endTransmission();                 //end the I2C data transmission.
             
             if(i==1 || i==3){
-                delay(800);                     //wait the correct amount of time for each specific circuit to complete its instruction.
+                delay(900);                     //wait the correct amount of time for each specific circuit to complete its instruction.
             }
             
             else if(i==2){                      
@@ -267,7 +205,7 @@ void take_reading() {
                     break;                          //exit the while loop.
                 }
             }
-            
+            measurements[i] = _data;
             
             //since EC sensor takes four different types of readings but sends as one, must parse them
             if(i==2){
@@ -301,7 +239,7 @@ void take_reading() {
             Wire.endTransmission();             //end the I2C data transmission.
             
           
-            memset (_data,0, sizeof(_data));    //clear _data for next reading
+            memset(_data,0, sizeof(_data));    //clear _data for next reading
         }
     }
     
@@ -362,7 +300,7 @@ void createDataStream(String name, String meas){
     //String myID = System.deviceID();
     // Create data string for the parameter to pass into write influx
     String data;
-    data = name+",node_id="+node_id+" value="+meas+" "+tie;
+    data = name+",node_id="+NODE_ID+" value="+meas+" "+tie;
     
         
     //write to influx and will try for 5 times before just taking a new reading
@@ -411,5 +349,38 @@ int writeinflux(String data){
     
     return 0;
 }
+
+//sleepTime given in Seconds
+void bootLegSleep(int sleepTime){
+    if (sleepTime <= 0){
+        return;
+    }
+    Cellular.off();
+    delay(sleepTime*1000);
+    bootLegWake();
+    
+}
+
+bool bootLegWake(){
+    Cellular.on();
+    Cellular.connect();
+    while(Cellular.connecting());
+    return true;
+}
+
+//timeOut given in seconds
+bool bootLegWake(int timeOut){
+    timeOut = timeOut *1000; //convert timeOut into milliseconds
+    Cellular.on();
+    Cellular.connect();
+    int currTime = 0;
+    int startTime = millis();
+    while(Cellular.connecting() && currTime < timeOut){
+        currTime = millis()-startTime;
+    }
+    return currTime < timeOut;
+}
+
+
 
 
