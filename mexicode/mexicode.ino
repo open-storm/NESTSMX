@@ -56,7 +56,7 @@ double adc = 0;                 //variable used for analog to digital conversion
 float mv=0;                     //millivolts measured from the ADC
 int awake = (30);               //how many SECONDS the photon will remain awake to recieve updates or whatever
 
-int presCounter = 0;
+int presCounter = 0;            //keeps track of where we are in an hour cycle
 /*
 .
 ..
@@ -97,35 +97,31 @@ void setup()
 }
 
 void loop(){
+    //get current time in milliseconds before doing any readings
     unsigned long startTime = millis();
-    //bootLegWake(); //wake up
-    p.setMotors("M3-B-100");
+    
+    //start by by sending pulse to turn off valve because we want to make sure valve is off on reset
+    p.setMotors("M3-B-100"); 
     delay(1000);
-    p.setMotors("M3-S");
+    p.setMotors("M3-S"); //stop supplying voltage to valve
+    
+    //take pressure reading
+    p.setMotors("M1-F-100"); //powers pressure sensor to take reading
+    float press = take_pressure();
+    p.setMotors("M1-S"); //stop supplying voltage
+    
     
     //start of hour cycle
-    if (presCounter == 0){
-        p.setMotors("M1-F-100");
-        float press = take_pressure();
-        p.setMotors("M1-S");
-        
-        if (press > PRESSURE_THRESHOLD){
-            water_exchange(FLUSH_TIME);
-            delay(2*60*1000); //delay 2 minutes
-            take_reading();
-        }
-        else {
-            delay(awake*1000); //stay on for awake seconds
-        }
-        
+    if (presCounter == 0 && press > PRESSURE_THRESHOLD){
+        water_exchange(FLUSH_TIME); //flush out water
+        delay(2*60*1000); //delay 2 minutes
+        take_reading(); //take EZO readings
     }
     else{
-        p.setMotors("M1-F-100");            //Turns on pressure
-        take_pressure();                    //Takes pressure reading on the water pipes. Eventually if pressure is available it will trigger the valve and then take WQ readings.
-        p.setMotors("M1-S");                //shutoff pressure supply
-        delay(awake*1000);                      //Just have one for awake seconds
+        delay(awake*1000);                      //Just have on for awake seconds
     }
     
+    //increment where we are within the cycle (presCounter returns to 0 after presCounter reaches SENS_READ_PERIOD / PRES_READ_PERIOD
     presCounter = (presCounter + 1) % (SENS_READ_PERIOD / PRES_READ_PERIOD);
     
     //TODO
@@ -139,8 +135,12 @@ void loop(){
     }
     */ 
     //while boron sleep is unestablished, simply delay
-    unsigned long timeElapsed= millis() - startTime; //gets time elapsed in milliseconds
-    delay(PRES_READ_PERIOD*60*1000 - timeElapsed);
+    //get current time after readings in milliseconds
+    unsigned long endTime = millis();
+    //get elapsed time between start of readings and after readings
+    unsigned long elapsedTime = endTime - startTime;
+    //delay for remaining time
+    delay(PRES_READ_PERIOD*60*1000 - elapsedTime);
     
 }
 
@@ -150,15 +150,31 @@ void take_reading() {
 
     for(int read = 0; read < NUM_READINGS; read++){
     //takes 3 readings of each parameter ~ 9 seconds run time
-        computerdata[0] = 'r';              //sends the command to read
+        computerdata[0] = 'r';              //set the command to read
         
         for (int i=0; i < NUM_SENSORS; i++){    //Initialize for-loop to address all 4 (0,1,2,3) positions of the circuits address[] array (goes through all the sensor ID's)
             
-            if (i == 3){
-                computerdata[1] = 't';
+            if (i == 3 || i == 2){
+                //set temperature compensation for pH sensor and EC sensor
+                computerdata[0] = 't'; //t takes first spot in array
+                computerdata[1] = ','; //, takes second spot
+                
+                //sets remaining characters in computer data (computerdata+2) to be temperature reading taken when i was 0 (measurements[0])
+                //Since measureents[0] is a String, we must convert to c_str for function to work correctly
                 strcpy(computerdata+2, measurements[0].c_str());
+                
+                Wire.beginTransmission(address[i]);     //call the circuit by its ID number.
+                Wire.write(computerdata);               //transmit the read command.
+                Wire.endTransmission();                 //end the I2C data transmission.
+                delay(300);
+                
+                //reset command to read
+                memset(computerdata,0, sizeof(computerdata));    
+                computerdata[0] = 'r';
+                
             }   
-
+            
+            //take reading
             Wire.beginTransmission(address[i]);     //call the circuit by its ID number.
             Wire.write(computerdata);               //transmit the read command.
             Wire.endTransmission();                 //end the I2C data transmission.
@@ -196,7 +212,7 @@ void take_reading() {
                 Serial.println("No Data");   //means there is no further data to send.
                 break;                       //exits the switch case.
             }
-            
+                
             for (int j=0; Wire.available(); j++) {   //are there bytes to receive.
                 in_char = Wire.read();              //receive a byte. (ASCII number)
                 _data[j] = in_char;                 //load this byte into our array.
@@ -352,32 +368,41 @@ int writeinflux(String data){
 
 //sleepTime given in Seconds
 void bootLegSleep(int sleepTime){
+    //if given sleepTime is <0, take it as not sleeping
     if (sleepTime <= 0){
         return;
     }
+    //turn off cellular connection to save power
     Cellular.off();
+    //convert sleepTime to ms for delay function
     delay(sleepTime*1000);
+    //turn cellular connection back on
     bootLegWake();
     
 }
 
+//returns true if able to connect to Cellular
 bool bootLegWake(){
+    //try to connect
     Cellular.on();
     Cellular.connect();
+    //waits until connected to cellular before returning
     while(Cellular.connecting());
     return true;
 }
 
-//timeOut given in seconds
+//timeOut given in seconds, returns true if able to connect to Cellular, returns false if we wait past given timeOut
 bool bootLegWake(int timeOut){
     timeOut = timeOut *1000; //convert timeOut into milliseconds
-    Cellular.on();
+    Cellular.on(); //try to connect
     Cellular.connect();
-    int currTime = 0;
-    int startTime = millis();
+    int currTime = 0; //set currTime to 0
+    int startTime = millis(); // get startTime in milliseconds
+    //try to connect (breaks out of loop if we pass timeOut or are able to connect to Cellular)
     while(Cellular.connecting() && currTime < timeOut){
         currTime = millis()-startTime;
     }
+    //if currTime > timeOut, we were unable to connect to Cellular and return false
     return currTime < timeOut;
 }
 
